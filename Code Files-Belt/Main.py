@@ -1,12 +1,30 @@
-#!/usr/bin/env python3
-# pi_monitor.py  - Fixed GPS version with proper error handling + SMTP email alerts
+# pi_monitor.py - Enhanced GPS version v1.6 with fix awareness, satellite filtering, timeout, smoothing, GPRMC support, and debug logs
 
 import os
 import time
 import sys
 import threading
+from queue import Queue
 import webbrowser
+import smtplib
+import logging
+import subprocess
+from email.mime.text import MIMEText
 from pathlib import Path
+from collections import deque
+
+# -----------------------------
+# LOGGING SETUP
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("pi_monitor.log", encoding="utf-8"),
+    ]
+)
+logger = logging.getLogger(__name__)
 
 import tkinter as tk
 from tkinter import ttk
@@ -21,7 +39,16 @@ try:
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
-    print("PIL not available - camera preview disabled")
+    logger.warning("PIL not available - camera preview disabled")
+
+# picamera2 (Pi Camera Module) - preferred on modern Pi OS
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+    logger.info("picamera2 available - Pi Camera Module will be used")
+except Exception:
+    PICAMERA2_AVAILABLE = False
+    logger.warning("picamera2 not available - will try OpenCV (cv2.VideoCapture) as fallback")
 
 # Guarded RPi / smbus imports (gives readable errors when run off-Pi)
 try:
@@ -37,14 +64,14 @@ except Exception:
         def output(self, *a, **k): pass
         def cleanup(self, *a, **k): pass
     GPIO = _FakeGPIO()
-    print("Warning: RPi.GPIO not available. Running in non-hardware (test) mode.")
+    logger.warning("RPi.GPIO not available. Running in non-hardware (test) mode.")
 
 try:
     import smbus
     SMBUS_AVAILABLE = True
 except Exception:
     SMBUS_AVAILABLE = False
-    print("Warning: smbus not available. MPU6050 functions will be disabled.")
+    logger.warning("smbus not available. MPU6050 functions will be disabled.")
 
 # -----------------------------
 # CONSTANTS / CONFIG
@@ -57,25 +84,35 @@ ULTRASONICS = {
     "Back": {"TRIG": 6, "ECHO": 5, "wav": "back.wav"}
 }
 
-ULTRA_THRESHOLD = 20        # cm
-ULTRA_COOLDOWN = 10        # seconds
+ULTRA_THRESHOLD = 30        # cm
+ULTRA_COOLDOWN = 30          # seconds (increased from 5 to reduce spam)
 last_ultra_alert_time = {k: 0 for k in ULTRASONICS.keys()}
 
-TELEGRAM_BOT_TOKEN = "8592182368:AAFLgm0j5ObV2d28LMSkmkxIS_BnlJWT484"
-TELEGRAM_CHAT_ID = "5610685031"
+last_ultra_sound_time = {k: 0 for k in ULTRASONICS.keys()}
+SOUND_COOLDOWN = 2
+
+ULTRA_SCAN_INTERVAL = 0.2   # 200 ms (recommended)
+ultra_buffers = {k: deque(maxlen=3) for k in ULTRASONICS.keys()}
+ultra_keys = list(ULTRASONICS.keys())
+ultra_index = 0
+last_ultra_scan_time = 0
+last_ultra_values = {}  # Cache to retain ultrasonic values between scans
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5610685031")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 # -----------------------------
-# SMTP EMAIL SETTINGS (PLACEHOLDERS - replace with your values)
+# SMTP EMAIL SETTINGS (use environment variables or config)
 # -----------------------------
-SMTP_SERVER = "smtp.gmail.com"     # e.g. smtp.gmail.com
-SMTP_PORT = 587                    # e.g. 587 for STARTTLS
-SMTP_USER = "ankit22csu216@ncuindia.edu" # your smtp username
-SMTP_PASS = "cmditqeilnmmtote"    # your app password or SMTP password
-ALERT_EMAIL = "ankit22csu216@ncuindia.edu"  # recipient address
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")     # e.g. smtp.gmail.com
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))                # e.g. 587 for STARTTLS
+SMTP_USER = os.getenv("SMTP_USER", "ankit22csu216@ncuindia.edu") # your smtp username
+SMTP_PASS = os.getenv("SMTP_PASS", "")    # your app password or SMTP password
+ALERT_EMAIL = os.getenv("ALERT_EMAIL", "ankit22csu216@ncuindia.edu")  # recipient address
 
-STATIC_LAT = 28.6139
-STATIC_LON = 77.2090
+STATIC_LAT = 28.5039491
+STATIC_LON = 77.0490655
 
 SOUNDS_DIR = Path("sounds")
 SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,12 +120,70 @@ SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
 LAST_EMERGENCY_TIME = 0
 EMERGENCY_COOLDOWN = 10
 
+# GPS specific constants
+GPS_TIMEOUT = 5  # seconds for stale data timeout
+
+# ========================================
+# ALERT QUEUE & WORKER (Thread-Safe)
+# ========================================
+alert_queue = Queue(maxsize=100)
+last_alert_sent = {}  # Rate limiting per alert type
+ALERT_MIN_INTERVAL = 10  # seconds between alerts of same type
+
+def can_send(key):
+    """Check if enough time has passed to send another alert of this type"""
+    now = time.time()
+    t = last_alert_sent.get(key, 0)
+    if now - t >= ALERT_MIN_INTERVAL:
+        last_alert_sent[key] = now
+        return True
+    return False
+
+def enqueue_alert(kind, msg, subject="Alert"):
+    """Non-blocking alert enqueueing (drops if queue full)"""
+    try:
+        alert_queue.put_nowait({
+            "kind": kind,  # "telegram" | "email" | "both"
+            "msg": msg,
+            "subject": subject
+        })
+    except Exception:
+        logger.warning("Alert queue full — dropping alert")
+
+def alert_worker():
+    """Background worker to send alerts from queue"""
+    while True:
+        item = alert_queue.get()
+        if item is None:
+            break  # graceful shutdown signal
+
+        try:
+            kind = item.get("kind")
+            msg = item.get("msg")
+            subject = item.get("subject", "Alert")
+
+            if kind in ("telegram", "both"):
+                send_telegram(msg)
+
+            if kind in ("email", "both"):
+                send_email(subject, msg)
+
+        except Exception as e:
+            logger.error(f"Alert worker error: {e}")
+        finally:
+            alert_queue.task_done()
+
+# Start alert worker thread
+alert_thread = threading.Thread(target=alert_worker, daemon=True)
+alert_thread.start()
+logger.info("Alert worker thread started")
+
 # DNN model files (ensure they exist or skip model)
-PROTOTXT = "MobileNetSSD_deploy.prototxt.txt"
-MODEL = "MobileNetSSD_deploy.caffemodel"
+PROTOTXT = "models/MobileNetSSD_deploy.prototxt"
+MODEL = "models/MobileNetSSD_deploy.caffemodel"
 
 # -----------------------------
-# GPS Reader (threaded) - FIXED VERSION
+# Enhanced GPS Reader (threaded) - v1.7 with HDOP, safe reconnect, cold start
 # -----------------------------
 import serial
 
@@ -98,27 +193,32 @@ class GPSReader:
         self.lat_in_degrees = STATIC_LAT
         self.lon_in_degrees = STATIC_LON
         self.gps_available = False
+        self.has_fix = False
         self.running = False
         self.gps_thread = None
         self.last_gps_data_time = 0
         self.gps_data_count = 0
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
+        self.lat_buffer = deque(maxlen=5)
+        self.lon_buffer = deque(maxlen=5)
+        logger.info("Waiting for first GPS fix...")
         self.initialize_gps()
 
     def initialize_gps(self):
         """Initialize GPS with proper error handling"""
+        logger.info("GPS: Cold start - waiting for first fix (may take 30s-5min)...")
         # Common GPS configurations for Raspberry Pi
         gps_configs = [
-            {"port": "/dev/ttyAMA0", "baudrate": 9600},  # GPIO serial
-            {"port": "/dev/serial0", "baudrate": 9600},  # Alias for GPIO serial
-            {"port": "/dev/ttyS0", "baudrate": 9600},    # Mini UART
-            {"port": "/dev/ttyUSB0", "baudrate": 9600},  # USB GPS
+            {"port": "/dev/ttyAMA0", "baudrate": 9600},
+            {"port": "/dev/serial0", "baudrate": 9600},
+            {"port": "/dev/ttyS0", "baudrate": 9600},
+            {"port": "/dev/ttyUSB0", "baudrate": 9600},
         ]
         
         for config in gps_configs:
             try:
-                print(f"Attempting to initialize GPS on {config['port']}...")
+                logger.info(f"GPS: Trying port {config['port']}...")
                 self.ser = serial.Serial(
                     port=config['port'],
                     baudrate=config['baudrate'],
@@ -131,105 +231,143 @@ class GPSReader:
                     dsrdtr=False
                 )
                 
-                # Test if we can read from the port
                 if self.ser.is_open:
-                    # Clear any existing data in buffer
                     self.ser.reset_input_buffer()
                     self.ser.reset_output_buffer()
                     
-                    # Try to read a line to verify GPS is working
                     test_line = self.ser.readline().decode('ascii', errors='ignore')
                     if test_line:
-                        print(f"GPS successfully initialized on {config['port']}")
-                        print(f"Test data: {test_line.strip()}")
+                        logger.info(f"GPS initialized: {config['port']}")
+                        logger.debug(f"Test: {test_line.strip()}")
                         self.gps_available = True
+                        self.has_fix = False  # Wait for valid data
                         break
                     else:
-                        print(f"GPS on {config['port']} opened but no data received")
+                        logger.warning(f"GPS {config['port']} no data")
                         self.ser.close()
                 else:
-                    print(f"Failed to open {config['port']}")
+                    logger.warning(f"Cannot open {config['port']}")
                     
             except Exception as e:
-                print(f"GPS initialization failed on {config['port']}: {e}")
-                if self.ser and self.ser.is_open:
+                logger.error(f"GPS init {config['port']}: {e}")
+                if hasattr(self, 'ser') and self.ser and self.ser.is_open:
                     self.ser.close()
                 self.ser = None
                 
         if not self.gps_available:
-            print("GPS initialization failed on all ports. Using static coordinates.")
-            print("To enable GPS, make sure:")
-            print("1. GPS module is properly connected")
-            print("2. Serial is enabled in raspi-config")
-            print("3. No other services are using the serial port (like console)")
+            logger.warning("GPS: All ports failed. Using static location fallback.")
+            logger.warning("Check wiring, raspi-config serial, and GPS power.")
             return
             
         self.running = True
         self.reconnect_attempts = 0
+        if hasattr(self, 'gps_thread') and self.gps_thread and self.gps_thread.is_alive():
+            logger.debug("Stopping old GPS thread before new...")
+            self.running = False
+            self.gps_thread.join(timeout=1.0)
         self.gps_thread = threading.Thread(target=self._gps_loop, daemon=True)
         self.gps_thread.start()
-        print("GPS thread started successfully")
+        logger.info("GPS v1.7 thread active")
 
     def _convert_to_degrees(self, raw_value):
-        """Convert NMEA coordinates to decimal degrees"""
+        """Convert NMEA coordinates (DDmm.mmmm) to decimal degrees"""
         try:
             if not raw_value or raw_value == '':
                 return 0.0
-            decimal_value = float(raw_value) / 100.0
-            degrees = int(decimal_value)
-            minutes = decimal_value - degrees
-            position = degrees + (minutes / 0.6)
+            raw_float = float(raw_value)
+            degrees = int(raw_float / 100)
+            minutes = raw_float - (degrees * 100)
+            position = degrees + (minutes / 60.0)
             return round(position, 6)
         except Exception as e:
-            print(f"GPS degree conversion error for '{raw_value}': {e}")
+            logger.error(f"GPS degree conversion error for '{raw_value}': {e}")
             return 0.0
 
     def _parse_gps_data(self, received_data):
-        """Parse NMEA GPS data with robust error handling"""
+        """Parse NMEA GPS data - supports GPGGA and GPRMC with enhanced filtering"""
         try:
+            # GPGGA parsing (primary)
             if "$GPGGA" in received_data:
-                # Log raw data for debugging (first few characters only)
                 if self.gps_data_count < 10:  # Only log first 10 messages
-                    print(f"GPS Raw: {received_data[:80]}...")
+                    logger.debug(f"GPS Raw GPGGA: {received_data[:80]}...")
                 
-                # Parse GPGGA sentence
                 parts = received_data.split("$GPGGA,", 1)[1].split(',')
                 
                 if len(parts) >= 10:
-                    nmea_lat = parts[1]  # Latitude
-                    nmea_lat_dir = parts[2]  # N/S
-                    nmea_lon = parts[3]  # Longitude  
-                    nmea_lon_dir = parts[4]  # E/W
-                    fix_quality = parts[5]  # GPS fix quality (0=no fix, 1=GPS, 2=DGPS)
-                    satellites = parts[6]  # Number of satellites
+                    nmea_lat = parts[1]
+                    nmea_lat_dir = parts[2]
+                    nmea_lon = parts[3]  
+                    nmea_lon_dir = parts[4]
+                    fix_quality = parts[5]
+                    satellites = parts[6]
                     
-                    # Check if we have a valid GPS fix
-                    if fix_quality and fix_quality.isdigit() and int(fix_quality) > 0:
-                        if nmea_lat and nmea_lon and len(nmea_lat) > 0 and len(nmea_lon) > 0:
-                            lat = self._convert_to_degrees(nmea_lat)
-                            lon = self._convert_to_degrees(nmea_lon)
+                    if self.gps_data_count % 20 == 0:
+                        logger.info(f"GPS Status - Fix: {fix_quality}, Sats: {satellites}")
+                    
+                    # Enhanced validation: fix + sats + HDOP
+                    if (len(parts) >= 11 and fix_quality and fix_quality.isdigit() and int(fix_quality) > 0 and 
+                        satellites and satellites.isdigit() and int(satellites) >= 4):
+                        
+                        hdop_str = parts[8] if len(parts) > 8 and parts[8] else "999"
+                        try:
+                            hdop = float(hdop_str)
+                        except:
+                            hdop = 999.0
                             
-                            # Apply direction (N/S, E/W)
+                        if hdop < 2.5:
+                            if nmea_lat and nmea_lon and len(nmea_lat) > 0 and len(nmea_lon) > 0:
+                                lat = self._convert_to_degrees(nmea_lat)
+                                lon = self._convert_to_degrees(nmea_lon)
+                            
                             if nmea_lat_dir == 'S':
                                 lat = -lat
                             if nmea_lon_dir == 'W':
                                 lon = -lon
                                 
-                            # Validate coordinates (rough bounds)
                             if -90 <= lat <= 90 and -180 <= lon <= 180:
-                                print(f"GPS Fix: Lat={lat:.6f}, Lon={lon:.6f}, Satellites={satellites}, Quality={fix_quality}")
+                                logger.info(f"GPS VALID FIX: Lat={lat:.6f}, Lon={lon:.6f}, Sat={satellites}, Quality={fix_quality}")
+                                self.has_fix = True
                                 return lat, lon
                             else:
-                                print(f"GPS: Invalid coordinates: lat={lat}, lon={lon}")
+                                logger.warning(f"GPS: Invalid coordinates: lat={lat}, lon={lon}")
                         else:
-                            print("GPS: Empty latitude/longitude data")
+                            logger.warning("GPS: Empty latitude/longitude data")
                     else:
-                        if self.gps_data_count % 10 == 0:  # Don't spam
-                            print(f"GPS: Waiting for fix (quality: {fix_quality}, satellites: {satellites})")
-                else:
-                    print(f"GPS: Incomplete GPGGA sentence ({len(parts)} parts)")
+                        self.has_fix = False
+                        if self.gps_data_count % 10 == 0:
+                            logger.debug(f"GPS: No valid fix (quality: {fix_quality}, sats: {satellites})")
+                            
+            # GPRMC parsing (backup/more reliable sometimes)
+            elif "$GPRMC" in received_data:
+                if self.gps_data_count < 10:
+                    logger.debug(f"GPS Raw GPRMC: {received_data[:80]}...")
+                
+                parts = received_data.split("$GPRMC,", 1)[1].split(',')
+                
+                if len(parts) >= 9 and parts[2] == 'A':  # 'A' = active (valid fix)
+                    nmea_lat = parts[3]
+                    nmea_lat_dir = parts[4]
+                    nmea_lon = parts[5]
+                    nmea_lon_dir = parts[6]
+                    
+                    if nmea_lat and nmea_lon:
+                        lat = self._convert_to_degrees(nmea_lat)
+                        lon = self._convert_to_degrees(nmea_lon)
+                        
+                        if nmea_lat_dir == 'S':
+                            lat = -lat
+                        if nmea_lon_dir == 'W':
+                            lon = -lon
+                            
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            logger.info(f"GPS GPRMC FIX: Lat={lat:.6f}, Lon={lon:.6f}")
+                            self.has_fix = True
+                            return lat, lon
+                            
         except Exception as e:
-            print(f"GPS parsing error: {e}")
+            logger.error(f"GPS parsing error: {e}")
+            
+        self.has_fix = False
         return None, None
 
     def _gps_loop(self):
@@ -239,65 +377,72 @@ class GPSReader:
         
         while self.running:
             try:
-                # Check if serial port is available and open
                 if not self.ser or not self.ser.is_open:
                     if self.reconnect_attempts < self.max_reconnect_attempts:
-                        print("GPS port closed, attempting to reconnect...")
+                        logger.warning("GPS port closed, attempting to reconnect...")
                         self.reconnect_attempts += 1
                         self.initialize_gps()
                         time.sleep(2)
                         continue
                     else:
-                        print("Max GPS reconnect attempts reached. Giving up.")
+                        logger.error("Max GPS reconnect attempts reached. Giving up.")
                         break
                 
-                # Read data from GPS
-                if self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('ascii', errors='ignore').strip()
-                    if line:
-                        consecutive_errors = 0  # Reset error counter on successful read
-                        self.gps_data_count += 1
-                        lat, lon = self._parse_gps_data(line)
-                        if lat is not None and lon is not None:
-                            self.lat_in_degrees = lat
-                            self.lon_in_degrees = lon
+                line = self.ser.readline().decode('ascii', errors='ignore').strip()
+                if line:
+                    consecutive_errors = 0
+                    self.gps_data_count += 1
+                    lat, lon = self._parse_gps_data(line)
+                    if lat is not None and lon is not None:
+                            # Apply moving average smoothing
+                            self.lat_buffer.append(lat)
+                            self.lon_buffer.append(lon)
+                            self.lat_in_degrees = sum(self.lat_buffer) / len(self.lat_buffer)
+                            self.lon_in_degrees = sum(self.lon_buffer) / len(self.lon_buffer)
                             self.last_gps_data_time = time.time()
                             if self.gps_data_count <= 10 or self.gps_data_count % 50 == 0:
-                                print(f"GPS Update #{self.gps_data_count}: {lat:.6f}, {lon:.6f}")
+                                logger.info(f"GPS SMOOTHED #{self.gps_data_count}: {self.lat_in_degrees:.6f}, {self.lon_in_degrees:.6f} (fix={self.has_fix})")
                 else:
-                    # No data available, just wait
                     time.sleep(0.1)
                     
             except serial.SerialException as e:
                 consecutive_errors += 1
-                print(f"GPS Serial error #{consecutive_errors}: {e}")
-                
+                logger.error(f"GPS Serial error #{consecutive_errors}: {e}")
                 if consecutive_errors >= max_consecutive_errors:
-                    print("Too many serial errors, attempting to reset GPS connection...")
+                    logger.error("Too many serial errors, attempting to reset GPS connection...")
                     try:
                         if self.ser and self.ser.is_open:
                             self.ser.close()
-                    except:
-                        pass
+                    except Exception as close_err:
+                        logger.warning(f"Error closing GPS serial port: {close_err}")
                     self.ser = None
                     consecutive_errors = 0
                     time.sleep(2)
                     
             except Exception as e:
                 consecutive_errors += 1
-                print(f"GPS Unexpected error #{consecutive_errors}: {e}")
-                
+                logger.error(f"GPS Unexpected error #{consecutive_errors}: {e}")
                 if consecutive_errors >= max_consecutive_errors:
-                    print("Too many unexpected errors in GPS loop")
+                    logger.error("Too many unexpected errors in GPS loop")
                     break
-                    
                 time.sleep(1)
 
-        print("GPS thread stopped")
+        logger.info("GPS thread stopped")
 
     def get_coordinates(self):
-        """Get current coordinates (real GPS or fallback to static)"""
-        return self.lat_in_degrees, self.lon_in_degrees
+        """Get current coordinates with fix/timeout validation"""
+        # Check timeout first
+        if time.time() - self.last_gps_data_time > GPS_TIMEOUT:
+            logger.debug("GPS data timeout - no valid fix")
+            self.has_fix = False
+            return None, None
+        
+        # Return valid fix coordinates or None
+        if self.has_fix:
+            return self.lat_in_degrees, self.lon_in_degrees
+        else:
+            logger.debug("No GPS fix available")
+            return None, None
 
     def stop(self):
         """Stop GPS thread and close serial port"""
@@ -305,33 +450,26 @@ class GPSReader:
         try:
             if self.ser and self.ser.is_open:
                 self.ser.close()
-                print("GPS serial port closed")
+                logger.info("GPS serial port closed")
         except Exception as e:
-            print(f"GPS stop error: {e}")
+            logger.error(f"GPS stop error: {e}")
 
 gps_reader = GPSReader()
-
-# ... [REST OF THE CODE REMAINS THE SAME AS YOUR LAST WORKING VERSION] ...
 
 # -----------------------------
 # Telegram helper
 # -----------------------------
 def send_telegram(msg):
     try:
-        # Remove emojis from messages (keeps simple plain text)
-        msg = msg.replace("ALERT", "ALERT:").replace("EMERGENCY", "EMERGENCY:").replace("ALERT", "ALERT:")
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
         requests.post(TELEGRAM_API_URL, data=data, timeout=3)
-        print(f"Telegram sent: {msg}")
+        logger.info(f"Telegram sent: {msg}")
     except Exception as e:
-        print(f"Telegram send failed: {e}")
+        logger.error(f"Telegram send failed: {e}")
 
 # -----------------------------
 # EMAIL HELPER (SMTP)
 # -----------------------------
-import smtplib
-from email.mime.text import MIMEText
-
 def send_email(subject, body):
     try:
         msg = MIMEText(body, "plain")
@@ -339,28 +477,25 @@ def send_email(subject, body):
         msg["From"] = SMTP_USER
         msg["To"] = ALERT_EMAIL
 
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10)
-        server.ehlo()
-        # Use STARTTLS if port is 587 (typical). If you use SSL (465), you'd use smtplib.SMTP_SSL(...)
-        try:
-            server.starttls()
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
             server.ehlo()
-        except Exception:
-            # some servers may not support starttls - ignore and proceed
-            pass
+            try:
+                server.starttls()
+                server.ehlo()
+            except Exception as tls_err:
+                logger.warning(f"STARTTLS not supported, proceeding without it: {tls_err}")
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
 
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
-        server.quit()
-
-        print(f"EMAIL SENT: {subject} -> {ALERT_EMAIL}")
+        logger.info(f"EMAIL SENT: {subject} -> {ALERT_EMAIL}")
     except Exception as e:
-        print(f"Email send failed: {e}")
+        logger.error(f"Email send failed: {e}")
 
 # -----------------------------
 # GPIO setup (safe)
 # -----------------------------
 if ON_PI:
+    GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(EMERGENCY_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     for s in ULTRASONICS.values():
@@ -377,30 +512,32 @@ if SMBUS_AVAILABLE:
         bus = smbus.SMBus(1)
         bus.write_byte_data(MPU_ADDR, 0x6B, 0)   # wake up
         mpu_available = True
-        print("MPU6050 initialized")
+        logger.info("MPU6050 initialized")
     except Exception as e:
-        print("MPU6050 not available:", e)
+        logger.warning(f"MPU6050 not available: {e}")
         mpu_available = False
+
+def _mpu_read_word(reg: int) -> float:
+    """Read a signed 16-bit word from MPU6050 register pair."""
+    h = bus.read_byte_data(MPU_ADDR, reg)
+    l = bus.read_byte_data(MPU_ADDR, reg + 1)
+    v = (h << 8) + l
+    if v >= 0x8000:
+        return float(-((65535 - v) + 1))
+    return float(v)
 
 def read_mpu6050():
     if not mpu_available:
         return 0.0, 0.0, 0.0, 1.0
-    def rw(reg):
-        h = bus.read_byte_data(MPU_ADDR, reg)
-        l = bus.read_byte_data(MPU_ADDR, reg+1)
-        v = (h << 8) + l
-        if v >= 0x8000:
-            return -((65535 - v) + 1)
-        return v
     try:
-        x = rw(0x3B)/16384.0
-        y = rw(0x3D)/16384.0
-        z = rw(0x3F)/16384.0
+        x = _mpu_read_word(0x3B) / 16384.0
+        y = _mpu_read_word(0x3D) / 16384.0
+        z = _mpu_read_word(0x3F) / 16384.0
         mag = round((x*x + y*y + z*z) ** 0.5, 3)
-        return round(x,2), round(y,2), round(z,2), mag
+        return round(x, 2), round(y, 2), round(z, 2), mag
     except Exception as e:
-        print("MPU read error:", e)
-        return 0.0,0.0,0.0,1.0
+        logger.error(f"MPU read error: {e}")
+        return 0.0, 0.0, 0.0, 1.0
 
 # -----------------------------
 # Fall detection params
@@ -413,27 +550,28 @@ FALL_COOLDOWN = 30
 def get_map_link(lat=None, lon=None):
     if lat is None or lon is None:
         lat, lon = gps_reader.get_coordinates()
+        if lat is None or lon is None:
+            lat, lon = STATIC_LAT, STATIC_LON
     return f"https://www.google.com/maps?q={lat},{lon}"
 
 def check_fall(mag):
     global last_fall_alert
+    if not mpu_available or mag == 0.0:
+        return
     now = time.time()
     if (mag < FALL_THRESHOLD_LOW or mag > FALL_THRESHOLD_HIGH) and (now - last_fall_alert > FALL_COOLDOWN):
         lat, lon = gps_reader.get_coordinates()
-        msg = f"ALERT: Fall Detected! Mag={mag}\nLocation: {get_map_link(lat, lon)}"
-
-        # Telegram
-        send_telegram(msg)
-        # Email
-        send_email("Fall Detected!", msg)
-
+        if lat is None or lon is None:
+            lat, lon = STATIC_LAT, STATIC_LON
+        msg = f"ALERT: Fall Detected! Mag={mag}\\nLocation: {get_map_link(lat, lon)}"
+        enqueue_alert("both", msg, "Fall Detected!")
         last_fall_alert = now
-        print(f"Fall detected! Magnitude: {mag}")
+        logger.warning(f"Fall detected! Magnitude: {mag}")
 
 # -----------------------------
 # Ultrasonic (with timeouts)
 # -----------------------------
-def read_ultrasonic(name, timeout=0.03):
+def read_ultrasonic(name, timeout=0.025):  # balanced speed/accuracy
     """Return distance in cm or 999.0 on timeout/invalid"""
     if not ON_PI:
         return 999.0
@@ -446,14 +584,12 @@ def read_ultrasonic(name, timeout=0.03):
         GPIO.output(s["TRIG"], False)
 
         start_time = time.time()
-        start = None
-        # wait for echo to go HIGH
         while GPIO.input(s["ECHO"]) == 0:
             if time.time() - start_time > timeout:
                 return 999.0
-            start = time.time()
+        start = time.time()
 
-        # wait for echo to go LOW
+        stop = None
         stop_time = time.time()
         while GPIO.input(s["ECHO"]) == 1:
             if time.time() - stop_time > timeout:
@@ -469,14 +605,13 @@ def read_ultrasonic(name, timeout=0.03):
             return 999.0
         return round(dist, 2)
     except Exception as e:
-        print("Ultrasonic read error:", e)
+        logger.error(f"Ultrasonic read error: {e}")
         return 999.0
 
 def read_emergency():
     if not ON_PI:
         return False
     try:
-        # configured with pull-up; pressed == LOW
         return GPIO.input(EMERGENCY_PIN) == GPIO.LOW
     except Exception:
         return False
@@ -488,106 +623,163 @@ CLASSES = ["background","aeroplane","bicycle","bird","boat","bottle","bus",
            "car","cat","chair","cow","diningtable","dog","horse","motorbike",
            "person","pottedplant","sheep","sofa","train","tvmonitor"]
 
-DANGEROUS = {"car","dog","train"}  # use set and lower-case matching
+DANGEROUS = {"car","dog","train"}
 net = None
 if os.path.exists(PROTOTXT) and os.path.exists(MODEL):
     try:
         net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
-        print("DNN loaded successfully")
+        logger.info("DNN loaded successfully")
     except Exception as e:
-        print("Failed to load DNN:", e)
+        logger.error(f"Failed to load DNN: {e}")
         net = None
 else:
-    print("DNN files not found; continuing without object detection.")
-    print(f"Looking for: {PROTOTXT} and {MODEL}")
+    logger.warning("DNN files not found; continuing without object detection.")
+    logger.warning(f"Looking for: {PROTOTXT} and {MODEL}")
 
 def play_sound_file(path: Path):
     try:
         if path.exists():
-            # use aplay (non-blocking & quiet)
-            os.system(f"aplay -q {str(path)} &")
+            subprocess.Popen(["aplay", "-q", str(path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        print("Play sound error:", e)
+        logger.error(f"Play sound error: {e}")
 
 # -----------------------------
 # GUI Class
 # -----------------------------
 class GUI:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Pi3 Object & Hardware Monitor")
-        root.geometry("980x640")
+        root.title("SATRA - Smart Alert & Tracking for Risk Avoidance")
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+
+        root.geometry(f"{screen_w}x{screen_h}")
+        root.minsize(1024, 600)
+        try:
+            root.state("zoomed")
+        except:
+            root.attributes("-zoomed", True)
         root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        # Configure theme
         style = ttk.Style()
-        style.configure("Header.TLabel", font=("Arial", 16, "bold"))
-        style.configure("Info.TLabel", font=("Arial", 12))
+        style.theme_use("clam")
+        style.configure(".", background="#1e1e1e", foreground="white")
+        style.configure("TLabelframe", background="#1e1e1e", foreground="white")
+        style.configure("TLabelframe.Label", background="#1e1e1e", foreground="#00ffcc")
+        style.configure("TLabel", background="#1e1e1e", foreground="white")
+        style.configure("TButton", padding=6)
+        style.configure("Header.TLabel", font=("Arial", 15, "bold"))
+        style.configure("Title.TLabel", font=("Arial", 10, "bold"))
+        style.configure("Info.TLabel", font=("Arial", 11))
+        style.configure("Card.TFrame", relief="solid", borderwidth=1, background="#2a2a2a")
+        style.configure("CardSafe.TFrame", background="#1b4d1b")
+        style.configure("CardWarn.TFrame", background="#6f5500")
+        style.configure("CardAlert.TFrame", background="#6d1e1e")
+        style.configure("CardOffline.TFrame", background="#2a2a2a")
+        style.configure("Footer.TFrame", background="#171717")
+        style.configure("Footer.TLabel", background="#171717", foreground="#9effff")
+        style.configure("CameraStatus.TLabel", background="#1e1e1e", foreground="#ff0000", font=("Arial", 11, "bold"))
 
-        top = ttk.Frame(root, padding=8)
-        top.pack(fill="x")
+        # Main container with grid layout
+        container = ttk.Frame(root, padding=8)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1, uniform="group1")
+        container.columnconfigure(1, weight=3, uniform="group1")
+        container.rowconfigure(1, weight=1)
+        container.rowconfigure(2, weight=0)
+        container.rowconfigure(3, weight=0)
 
-        ttk.Label(top, text="Pi3 Object & Hardware Monitor", style="Header.TLabel").pack(side="left")
+        # ===== HEADER =====
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=5)
 
-        ctr = ttk.Frame(top)
-        ctr.pack(side="right")
-        self.start_cam_btn = ttk.Button(ctr, text="Start Camera", command=self.start_camera)
-        self.start_cam_btn.pack(side="left", padx=4)
-        self.stop_cam_btn = ttk.Button(ctr, text="Stop Camera", command=self.stop_camera)
-        self.stop_cam_btn.pack(side="left", padx=4)
+        ttk.Label(header, text="SATRA - Smart Alert & Tracking for Risk Avoidance", style="Header.TLabel").pack(side="left", padx=5)
+        self.time_lbl = ttk.Label(header, font=("Arial", 11))
+        self.time_lbl.pack(side="left", padx=20)
+        self.update_clock()
+
+        # Quick action buttons
+        btn_frame = ttk.Frame(header)
+        btn_frame.pack(side="right", padx=5)
+        self.start_cam_btn = ttk.Button(btn_frame, text="[START] Start Cam", command=self.start_camera)
+        self.start_cam_btn.pack(side="left", padx=3)
+        self.stop_cam_btn = ttk.Button(btn_frame, text="[STOP] Stop Cam", command=self.stop_camera)
+        self.stop_cam_btn.pack(side="left", padx=3)
         self.stop_cam_btn.state(["disabled"])
-        self.gps_status_btn = ttk.Button(ctr, text="GPS Status", command=self.show_gps_status)
-        self.gps_status_btn.pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="[MAP] Map", command=lambda: webbrowser.open(get_map_link())).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="[GPS] GPS Status", command=self.show_gps_status).pack(side="left", padx=3)
 
-        main = ttk.Frame(root, padding=8)
-        main.pack(fill="both", expand=True)
+        # ===== STATUS PANEL (LEFT) =====
+        status_frame = ttk.LabelFrame(container, text="System Status", padding=6)
+        status_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        status_frame.columnconfigure(0, weight=1)
+        status_frame.columnconfigure(1, weight=1)
 
-        left = ttk.LabelFrame(main, text="Hardware Status", padding=12)
-        left.pack(side="left", fill="y", padx=6)
+        # Helper to create status cards
+        def create_status_card(parent, title, row, col):
+            frame = ttk.Frame(parent, style="Card.TFrame", relief="solid", padding=8, borderwidth=1)
+            frame.grid(row=row, column=col, sticky="ew", padx=4, pady=4)
+            label_title = tk.Label(frame, text=title, font=("Arial", 10, "bold"), bg="#2a2a2a", fg="white")
+            label_title.pack(anchor="w")
+            value = tk.Label(frame, text="--", font=("Arial", 11), bg="#2a2a2a", fg="white")
+            value.pack(anchor="w")
+            value.card_frame = frame
+            return frame, value
 
-        self.mpu_lbl = ttk.Label(left, text="MPU6050: --", style="Info.TLabel")
-        self.mpu_lbl.pack(anchor="w", pady=5)
-        self.fall_lbl = ttk.Label(left, text="Fall: --", style="Info.TLabel")
-        self.fall_lbl.pack(anchor="w", pady=5)
-        self.ultra_lbl = ttk.Label(left, text="Ultrasonic: --", style="Info.TLabel")
-        self.ultra_lbl.pack(anchor="w", pady=5)
-        self.em_lbl = ttk.Label(left, text="Emergency: --", style="Info.TLabel")
-        self.em_lbl.pack(anchor="w", pady=5)
+        self.mpu_card, self.mpu_lbl = create_status_card(status_frame, "Accelerometer (MPU6050)", 0, 0)
+        self.fall_card, self.fall_lbl = create_status_card(status_frame, "Fall Detection", 0, 1)
+        self.ultra_card, self.ultra_lbl = create_status_card(status_frame, "Ultrasonic Sensors", 1, 0)
+        self.em_card, self.em_lbl = create_status_card(status_frame, "Emergency Button", 1, 1)
+        self.gps_status_card, self.gps_status_lbl = create_status_card(status_frame, "GPS Status", 2, 0)
+        self.gps_coords_card, self.gps_lbl = create_status_card(status_frame, "GPS Coordinates", 2, 1)
 
-        gps_status_frame = ttk.Frame(left)
-        gps_status_frame.pack(anchor="w", pady=5)
-        ttk.Label(gps_status_frame, text="GPS Status:", style="Info.TLabel").pack(side="left")
-        self.gps_status_lbl = ttk.Label(gps_status_frame,
-                                        text="Active" if gps_reader.gps_available else "Not Available",
-                                        style="Info.TLabel",
-                                        foreground="green" if gps_reader.gps_available else "red")
-        self.gps_status_lbl.pack(side="left", padx=6)
+        self.gps_status_lbl.config(text="Active" if gps_reader.gps_available else "Not Available")
+        self.gps_lbl.config(text="Coordinates: --,--")
 
-        gpsf = ttk.Frame(left)
-        gpsf.pack(anchor="w", pady=5)
-        ttk.Label(gpsf, text="GPS Coordinates:", style="Info.TLabel").pack(side="left")
-        self.gps_lbl = ttk.Label(gpsf, text="--,--", style="Info.TLabel")
-        self.gps_lbl.pack(side="left", padx=6)
+        # ===== CAMERA PANEL (RIGHT) =====
+        camera_frame = ttk.LabelFrame(container, text="Camera Feed", padding=10)
+        camera_frame.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
 
-        ttk.Button(left, text="Open Map", command=lambda: webbrowser.open(get_map_link())).pack(pady=6)
-
-        right = ttk.LabelFrame(main, text="Camera & Logs", padding=12)
-        right.pack(side="left", fill="both", expand=True)
-
-        # Camera status in GUI (no preview frame needed since we'll use external window)
-        self.camera_status_label = ttk.Label(right, text="Camera: Not Started", style="Info.TLabel")
-        self.camera_status_label.pack(pady=5)
+        self.camera_status_dot = ttk.Label(camera_frame, text="[●] Offline", style="CameraStatus.TLabel")
+        self.camera_status_dot.pack(anchor="w", pady=5)
         
-        self.log_box = tk.Text(right, height=15, state="disabled")
-        self.log_box.pack(fill="both", expand=True, pady=8)
+        self.camera_canvas = tk.Canvas(
+            camera_frame,
+            bg="black",
+            highlightthickness=0
+        )
+        self.camera_canvas.pack(fill="both", expand=True, pady=5)
+        self.tk_image = None  # Prevent garbage collection of PhotoImage
+        self.current_frame = None
 
-        # Camera state
+        # ===== LOGS PANEL (BOTTOM) =====
+        log_frame = ttk.LabelFrame(container, text="System Logs", padding=10)
+        log_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=5)
+        container.rowconfigure(2, weight=0)
+
+        self.log_box = tk.Text(log_frame, height=7, state="disabled", bg="#1e1e1e", fg="#00ff00", font=("Courier", 9))
+        self.log_box.pack(fill="both", expand=True, pady=5)
+
+        # Scrollbar for logs
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log_box["yscrollcommand"] = scrollbar.set
+
+        footer_frame = ttk.Frame(container, padding=6, style="Footer.TFrame")
+        footer_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        footer_frame.columnconfigure(0, weight=1)
+        self.footer_status_lbl = ttk.Label(footer_frame, text="System Online | Camera Active | GPS Fix | Alerts Enabled", style="Footer.TLabel")
+        self.footer_status_lbl.pack(side="left", padx=5)
+
         self.camera_running = False
         self.cap = None
         self.external_window_open = False
+        self.last_status_values = {}  # Track changes to avoid redundant updates
 
-        # start periodic hardware update
-        self.update_hw()
-        self.log("System initialized")
+        self.root.after(100, self.update_hw)
+        self.log("[INIT] System initialized")
 
     def on_closing(self):
         self.log("Shutting down...")
@@ -595,7 +787,6 @@ class GUI:
         try:
             if self.cap:
                 self.cap.release()
-            # Close any open OpenCV windows
             cv2.destroyAllWindows()
         except Exception:
             pass
@@ -604,212 +795,377 @@ class GUI:
             GPIO.cleanup()
         except Exception:
             pass
+        # Graceful alert queue shutdown
+        try:
+            alert_queue.put(None)  # Signal worker to stop
+        except Exception:
+            pass
         self.root.destroy()
 
     def log(self, msg):
+        """Log message with timestamp, auto-limit to 200 lines"""
         t = time.strftime("%H:%M:%S")
         self.log_box.config(state="normal")
         self.log_box.insert("end", f"[{t}] {msg}\n")
+
+        # Limit to last 200 lines to prevent memory issues
+        line_count = int(self.log_box.index('end-1c').split('.')[0])
+        if line_count > 200:
+            self.log_box.delete("1.0", "2.0")
+
         self.log_box.see("end")
         self.log_box.config(state="disabled")
 
+    def update_gui_frame(self):
+        try:
+            if hasattr(self, "current_frame") and self.current_frame is not None:
+                frame = self.current_frame
+
+                canvas_w = self.camera_canvas.winfo_width()
+                canvas_h = self.camera_canvas.winfo_height()
+
+                h, w = frame.shape[:2]
+
+                scale = min(canvas_w / w, canvas_h / h)
+
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+
+                frame = cv2.resize(frame, (new_w, new_h))
+
+                img = Image.fromarray(frame)
+                self.tk_image = ImageTk.PhotoImage(image=img)
+
+                x = (canvas_w - new_w) // 2
+                y = (canvas_h - new_h) // 2
+
+                self.camera_canvas.delete("all")
+                self.camera_canvas.create_image(
+                    x,
+                    y,
+                    anchor="nw",
+                    image=self.tk_image
+                )
+
+        except Exception as e:
+            self.log(f"GUI frame update error: {e}")
+        
+    def update_clock(self):
+        now = time.strftime("%H:%M:%S")
+        self.time_lbl.config(text=now)
+        self.root.after(1000, self.update_clock)
+
     def show_gps_status(self):
         lat, lon = gps_reader.get_coordinates()
-        status = "Active" if gps_reader.gps_available else "Not Available"
-        self.log(f"GPS Status: {status}, Coordinates: {lat:.6f}, {lon:.6f}")
-        self.log(f"GPS Data Count: {gps_reader.gps_data_count}")
+        
+        status = "HAS FIX" if gps_reader.has_fix else "NO FIX"
+        
+        if lat is not None and lon is not None:
+            coords = f"{lat:.6f}, {lon:.6f}"
+        else:
+            coords = "No valid coordinates"
+
+        msg = f"[GPS] Status: {status} | Coords: {coords} | Count: {gps_reader.gps_data_count}"
+        
+        self.log(msg)
+
+    def set_status(self, label, text, status="ok"):
+        """Update status label and card background with color coding"""
+        colors = {
+            "ok": "#00ff00",      # Green
+            "warn": "#ffcc00",    # Orange
+            "alert": "#ff6f6f",   # Red
+            "offline": "#999999"  # Gray
+        }
+        card_bg = {
+            "ok": "#1b4d1b",
+            "warn": "#6f5500",
+            "alert": "#6d1e1e",
+            "offline": "#2a2a2a"
+        }
+        label.config(text=text, fg=colors.get(status, "white"))
+        if hasattr(label, "card_frame"):
+            bg = card_bg.get(status, "#2a2a2a")
+            label.card_frame.config(style=f"Card{status.capitalize()}.TFrame")
+            for child in label.card_frame.winfo_children():
+                if isinstance(child, tk.Label):
+                    child.config(bg=bg)
+
+    def update_camera_status(self, running):
+        """Update camera status indicator"""
+        if running:
+            self.camera_status_dot.config(text="[●] Online", foreground="#00ff00")
+        else:
+            self.camera_status_dot.config(text="[●] Offline", foreground="#ff0000")
 
     def start_camera(self):
         if self.camera_running:
             return
         self.camera_running = True
+        self.update_camera_status(True)
         t = threading.Thread(target=self.cam_loop, daemon=True)
         t.start()
         self.start_cam_btn.state(["disabled"])
         self.stop_cam_btn.state(["!disabled"])
-        self.log("Camera started with external window.")
+        if PICAMERA2_AVAILABLE:
+            self.log("[CAM] Camera started using picamera2")
+        else:
+            self.log("[CAM] Camera started using OpenCV")
 
     def stop_camera(self):
         self.camera_running = False
-        self.log("Camera stopping...")
+        self.update_camera_status(False)
+        self.log("[CAM] Camera stopped")
         self.start_cam_btn.state(["!disabled"])
         self.stop_cam_btn.state(["disabled"])
-        # Close external window
-        cv2.destroyAllWindows()
         self.external_window_open = False
 
+    def _open_camera(self):
+        """Initialize and open camera (picamera2 or OpenCV)"""
+        if PICAMERA2_AVAILABLE:
+            try:
+                picam2 = Picamera2()
+                config = picam2.create_preview_configuration(
+                    main={"size": (640, 480), "format": "RGB888"},
+                    controls={"FrameRate": 20}
+                )
+                picam2.configure(config)
+                picam2.start()
+                time.sleep(0.5)
+                self.log("picamera2 started (640x480)")
+                return picam2, None
+            except Exception as e:
+                self.log(f"picamera2 failed: {e}")
+
+        for index in [0, 1, 2]:
+            cap = cv2.VideoCapture(index)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.log(f"OpenCV camera {index} (320x240)")
+                return None, cap
+            cap.release()
+        self.log("No camera available")
+        return None, None
+
     def cam_loop(self):
-        try:
-            self.cap = cv2.VideoCapture(0)
-            # Try to set resolution
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            
-            if not self.cap.isOpened():
-                self.log("Camera not found.")
-                self.camera_running = False
-                return
-                
-            self.log("Camera opened successfully - displaying in external window")
-        except Exception as e:
-            self.log(f"Camera error: {e}")
+        TARGET_FPS = 15
+        FRAME_MS = 1.0 / TARGET_FPS
+        DNN_EVERY_N = 60
+        frame_count = 0
+        last_detections = []
+
+        picam2, cap = self._open_camera()
+        if picam2 is None and cap is None:
             self.camera_running = False
+            self.root.after(0, lambda: self.start_cam_btn.state(["!disabled"]))
+            self.root.after(0, lambda: self.stop_cam_btn.state(["disabled"]))
             return
 
-        frame_count = 0
-        self.external_window_open = True
-        
-        while self.camera_running:
-            ret, frame = self.cap.read()
-            if not ret:
-                self.log("Failed to read camera frame")
-                time.sleep(0.1)
-                continue
-
-            frame_count += 1
-            detection_count = 0
-
-            # object detection
-            if net is not None:
+        try:
+            while self.camera_running:
+                t_start = time.time()
                 try:
-                    (h, w) = frame.shape[:2]
-                    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
-                    net.setInput(blob)
-                    detections = net.forward()
-                    
-                    for i in range(0, detections.shape[2]):
-                        confidence = detections[0, 0, i, 2]
-                        if confidence > 0.3:
-                            idx = int(detections[0, 0, i, 1])
-                            if 0 <= idx < len(CLASSES):
-                                label = CLASSES[idx]
-                            else:
-                                continue
-                                
-                            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                            (startX, startY, endX, endY) = box.astype("int")
-                            
-                            # Ensure bounding box is within frame dimensions
-                            startX = max(0, startX)
-                            startY = max(0, startY)
-                            endX = min(w, endX)
-                            endY = min(h, endY)
-                            
-                            # Draw bounding box and label
-                            color = (0, 255, 0)  # Green
-                            cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
-                            y = startY - 15 if startY - 15 > 15 else startY + 15
-                            cv2.putText(frame, f"{label}: {confidence:.2f}", (startX, y),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    if picam2 is not None:
+                        rgb = picam2.capture_array()
+                        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    else:
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
+                            time.sleep(0.1)
+                            continue
 
-                            detection_count += 1
-                            
-                            # play sound if exists
-                            wavpath = SOUNDS_DIR / f"{label}.wav"
-                            play_sound_file(wavpath)
+                    if net is not None and frame_count % DNN_EVERY_N == 0:
+                        try:
+                            (h, w) = frame.shape[:2]
+                            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (224, 224)), 0.007843, (224, 224), 127.5)
+                            net.setInput(blob)
+                            detections = net.forward()
 
-                            # dangerous detection notify (debounced)
-                            now = time.time()
-                            last = last_detection_alert.get(label, 0)
-                            if label.lower() in DANGEROUS and now - last > 30:
-                                lat, lon = gps_reader.get_coordinates()
-                                msg = f"ALERT: Dangerous Object: {label} at Loc: {get_map_link(lat, lon)}"
-                                send_telegram(msg)
-                                send_email("Dangerous Object Detected", msg)
-                                last_detection_alert[label] = now
-                                self.log(f"Dangerous object detected: {label}")
+                            last_detections = []
+                            for i in range(detections.shape[2]):
+                                confidence = detections[0, 0, i, 2]
+                                if confidence > 0.4:
+                                    idx = int(detections[0, 0, i, 1])
+                                    if idx >= len(CLASSES):
+                                        continue
+                                    label = CLASSES[idx]
+                                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                                    last_detections.append((label, box.astype("int"), confidence))
+
+                                    wavpath = SOUNDS_DIR / f"{label}.wav"
+                                    if wavpath.exists():
+                                        subprocess.Popen(["aplay", "-q", str(wavpath)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                                    now = time.time()
+                                    with _detection_alert_lock:
+                                        last_alert_time = last_detection_alert.get(label, 0)
+                                    if label.lower() in DANGEROUS and now - last_alert_time > 30:
+                                        lat, lon = gps_reader.get_coordinates()
+                                        if lat is None or lon is None:
+                                            lat, lon = STATIC_LAT, STATIC_LON
+                                        msg = f"ALERT: Dangerous {label} at {get_map_link(lat, lon)}"
+                                        if can_send(f"danger_{label}"):
+                                            enqueue_alert("both", msg, "Danger Alert")
+                                        with _detection_alert_lock:
+                                            last_detection_alert[label] = now
+
+                        except Exception as e:
+                            self.log(f"DNN error: {e}")
+
+                    for (label, box, conf) in last_detections:
+                        (startX, startY, endX, endY) = box
+                        cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
+                        cv2.putText(frame, f"{label} {conf:.2f}", (startX, max(startY - 10, 0)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
+                    elapsed = time.time() - t_start
+                    live_fps = 1.0 / elapsed if elapsed > 0 else 0
+                    cv2.putText(frame, f"FPS:{live_fps:.1f} F:{frame_count}", (4, 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
+
+                    # Convert and display frame in canvas
+                    if PIL_AVAILABLE:
+                        try:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                            # pass frame safely to main thread
+                            self.current_frame = frame_rgb
+                            self.root.after(0, self.update_gui_frame)
+
+                        except Exception as e:
+                            self.log(f"Canvas render error: {e}")
+        
+                    if frame_count % 60 == 0:
+                        self.log(f"Camera: frame={frame_count}, fps={live_fps:.1f}, detections={len(last_detections)}")
+
+                    frame_count += 1
 
                 except Exception as e:
-                    self.log(f"DNN error: {e}")
+                    self.log(f"Camera loop error: {e}")
+                    time.sleep(0.1)
+                    continue
 
-            # Display in external OpenCV window
-            try:
-                # Add frame counter and status to the frame
-                cv2.putText(frame, f"Frame: {frame_count} | Objects: {detection_count}", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                # Show the frame in external window
-                cv2.imshow('Camera Feed - Pi Monitor', frame)
-                
-                # Check for key press to exit (optional)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):  # Press 'q' to quit camera
-                    self.stop_camera()
-                    
-            except Exception as e:
-                self.log(f"OpenCV display error: {e}")
-                self.external_window_open = False
+                spent = time.time() - t_start
+                sleep_for = FRAME_MS - spent
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
 
-            # Update GUI status
-            self.camera_status_label.config(text=f"Camera: Running - Frame {frame_count}, Detections: {detection_count}")
-
-            # Log detection info occasionally
-            if frame_count % 30 == 0:  # Every 30 frames
-                self.log(f"Camera: Frame {frame_count}, Detections: {detection_count}")
-
-            time.sleep(0.03)  # small sleep to reduce CPU
-
-        # Cleanup when camera stops
-        try:
-            self.cap.release()
-            cv2.destroyAllWindows()
-            self.log("Camera released and window closed")
-        except Exception as e:
-            self.log(f"Camera cleanup error: {e}")
-            
-        self.camera_status_label.config(text="Camera: Stopped")
+        finally:
+            if picam2 is not None:
+                try:
+                    picam2.stop()
+                    picam2.close()
+                except Exception as e:
+                    self.log(f"picamera2 close error: {e}")
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception as e:
+                    self.log(f"OpenCV release error: {e}")
 
     def update_hw(self):
         try:
-            # Update GPS coords
             lat, lon = gps_reader.get_coordinates()
-            self.gps_lbl.config(text=f"{lat:.6f}, {lon:.6f}")
+            if lat is not None:
+                self.set_status(self.gps_lbl, f"Coordinates: {lat:.6f}, {lon:.6f}", "ok")
+                self.set_status(self.gps_status_lbl, "HAS FIX", "ok")
+            else:
+                self.set_status(self.gps_lbl, "Coordinates: Waiting for fix...", "warn")
+                self.set_status(self.gps_status_lbl, "NO FIX", "alert")
 
-            # MPU
             x, y, z, mag = read_mpu6050()
-            self.mpu_lbl.config(text=f"MPU6050: Mag={mag}")
-            check_fall(mag)
-            if mag < FALL_THRESHOLD_LOW or mag > FALL_THRESHOLD_HIGH:
-                self.fall_lbl.config(text="Fall: ALERT POSSIBLE")
+            if mpu_available:
+                self.set_status(self.mpu_lbl, f"Mag={mag:.1f}m/s²", "ok")
+                check_fall(mag)
+                if mag < FALL_THRESHOLD_LOW or mag > FALL_THRESHOLD_HIGH:
+                    self.set_status(self.fall_lbl, "ALERT - Fall Detected!", "alert")
+                else:
+                    self.set_status(self.fall_lbl, "Safe", "ok")
             else:
-                self.fall_lbl.config(text="Fall: Safe")
+                self.set_status(self.mpu_lbl, "Offline", "offline")
+                self.set_status(self.fall_lbl, "Offline", "offline")
 
-            # Emergency
             if read_emergency():
-                self.em_lbl.config(text="Emergency: ALERT Pressed")
-                self.log("Emergency Button Pressed!")
-                lat, lon = gps_reader.get_coordinates()
-                msg = f"EMERGENCY: EMERGENCY BUTTON PRESSED! Location: {get_map_link(lat, lon)}"
-                send_telegram(msg)
-                send_email("EMERGENCY BUTTON PRESSED!", msg)
-            else:
-                self.em_lbl.config(text="Emergency: Safe")
-
-            # Ultrasonics
-            uv = {}
-            now = time.time()
-            for n in ULTRASONICS.keys():
-                d = read_ultrasonic(n)
-                uv[n] = d
-                if d < ULTRA_THRESHOLD and now - last_ultra_alert_time[n] > ULTRA_COOLDOWN:
-                    last_ultra_alert_time[n] = now
-                    self.log(f"Ultrasonic Alert: {n} = {d}cm")
-                    wav = SOUNDS_DIR / ULTRASONICS[n]["wav"]
-                    play_sound_file(wav)
+                global LAST_EMERGENCY_TIME
+                now = time.time()
+                self.set_status(self.em_lbl, "ALERT!", "alert")
+                if now - LAST_EMERGENCY_TIME > EMERGENCY_COOLDOWN:
+                    LAST_EMERGENCY_TIME = now
+                    self.log("[ALERT] EMERGENCY BUTTON PRESSED!")
                     lat, lon = gps_reader.get_coordinates()
-                    msg = f"ALERT: Obstacle {n}. Dist={d} at Loc: {get_map_link(lat, lon)}"
-                    send_telegram(msg)
-                    send_email(f"Obstacle Alert - {n}", msg)
-            self.ultra_lbl.config(text=f"Ultrasonic: {uv}")
+                    if lat is None or lon is None:
+                        lat, lon = STATIC_LAT, STATIC_LON
+                    msg = f"EMERGENCY! Location: {get_map_link(lat, lon)}"
+                    enqueue_alert("both", msg, "EMERGENCY!")
+            else:
+                self.set_status(self.em_lbl, "Safe", "ok")
+
+
+            global last_ultra_scan_time, last_ultra_values, ultra_index, last_ultra_sound_time
+            uv = last_ultra_values.copy()
+            now = time.time()
+
+            # Scan only one sensor per loop (round-robin)
+            if now - last_ultra_scan_time >= ULTRA_SCAN_INTERVAL:
+                last_ultra_scan_time = now
+
+                n = ultra_keys[ultra_index]
+                ultra_index = (ultra_index + 1) % len(ultra_keys)
+                d = read_ultrasonic(n)
+
+                # Filtering: add to buffer if not error, else clear buffer
+                if d != 999.0:
+                    ultra_buffers[n].append(d)
+                else:
+                    ultra_buffers[n].clear()
+
+                # Use average if buffer has data
+                if len(ultra_buffers[n]) > 0:
+                    d = sum(ultra_buffers[n]) / len(ultra_buffers[n])
+                else:
+                    d = 999.0
+
+                if 2 <= d <= ULTRA_THRESHOLD:
+                    uv[n] = d
+                    last_ultra_values[n] = d
+
+                    # Play sound for all directions (with cooldown)
+                    if now - last_ultra_sound_time[n] > SOUND_COOLDOWN:
+                        play_sound_file(SOUNDS_DIR / ULTRASONICS[n]["wav"])
+                        last_ultra_sound_time[n] = now
+
+                    # ALERT ONLY FOR BACK
+                    if n == "Back":
+                        if now - last_ultra_alert_time[n] > ULTRA_COOLDOWN:
+                            last_ultra_alert_time[n] = now
+
+                            self.log(f"[WARN] Obstacle BACK: {d}cm")
+
+                            lat, lon = gps_reader.get_coordinates()
+                            if lat is None:
+                                lat, lon = STATIC_LAT, STATIC_LON
+
+                            msg = f"BACK Obstacle: {d}cm at {get_map_link(lat, lon)}"
+                            enqueue_alert("both", msg, "Back Obstacle Alert")
+                else:
+                    if n in last_ultra_values:
+                        del last_ultra_values[n]
+
+            # Update ultrasonic status with color coding
+            ultra_status = "ok" if len(uv) == 0 else "warn" if len(uv) <= 1 else "alert"
+            self.set_status(self.ultra_lbl, f"{str(uv) if uv else 'All clear'}", ultra_status if uv else "ok")
 
         except Exception as e:
             self.log(f"HW Error: {e}")
 
-        # schedule next update
-        self.root.after(500, self.update_hw)
+        self.root.after(100, self.update_hw)
 
-# global alert dict
+# Global alert protection
 last_detection_alert = {}
+_detection_alert_lock = threading.Lock()
 
 # -----------------------------
 # MAIN
@@ -820,18 +1176,15 @@ def main():
     try:
         root.mainloop()
     except KeyboardInterrupt:
-        print("Shutting down (KeyboardInterrupt)...")
+        logger.info("Shutdown (Ctrl+C)")
     finally:
-        try:
-            gps_reader.stop()
-        except Exception:
-            pass
+        gps_reader.stop()
         try:
             GPIO.cleanup()
         except Exception:
             pass
-        # Ensure all OpenCV windows are closed
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
+
